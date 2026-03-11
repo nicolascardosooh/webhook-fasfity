@@ -1,0 +1,25 @@
+# Deploy homolog (multirepo VPS)
+# Secrets: VPS_HOST, VPS_USER, VPS_SSH_KEY
+# Trigger: push na branch homologacao
+
+name: Deploy Homolog - Webhooks
+
+on:
+  push:
+    branches: [homologacao]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy Webhooks homolog
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          script: |
+            cd /root/homolog/webhooks-fastify
+            git pull origin homologacao
+            cd /root/homolog/docker
+            docker compose up -d --build webhooks

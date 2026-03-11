@@ -1,0 +1,25 @@
+# Deploy prod (multirepo VPS)
+# Secrets: VPS_HOST, VPS_USER, VPS_SSH_KEY
+# Trigger: push na branch producao
+
+name: Deploy Prod - Webhooks
+
+on:
+  push:
+    branches: [producao]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy Webhooks prod
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          script: |
+            cd /root/prod/webhooks-fastify
+            git pull origin producao
+            cd /root/prod/docker
+            docker compose up -d --build webhooks
