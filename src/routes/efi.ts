@@ -44,19 +44,15 @@ export async function efiRoutes(fastify: FastifyInstance) {
         where: { notificationToken },
       });
       if (alreadyProcessed) {
-        request.log.info(`[EFI Webhook] Notificação já processada (idempotência): ${notificationToken}`);
+        request.log.info(`[EFI Webhook] ⏩ Notificação ignorada: Já processada anteriormente (Token: ${notificationToken})`);
         return reply.code(200).send({ ok: true, message: "Notificação já processada" });
       }
 
-      request.log.info(`[EFI Webhook] Processando notificação: ${notificationToken}`);
+      request.log.info(`[EFI Webhook] 📥 Iniciando processamento do token: ${notificationToken}`);
 
       // 1. Validar notificação na EFI
       const notificationDetails = await efiService.getNotification(
         notificationToken
-      );
-
-      request.log.info(
-        `[EFI Webhook] Detalhes recuperados: ${JSON.stringify(notificationDetails)}`
       );
 
       // O retorno do getNotification é um array de eventos no campo 'data'
@@ -64,13 +60,17 @@ export async function efiRoutes(fastify: FastifyInstance) {
         notificationDetails.data?.[notificationDetails.data.length - 1];
 
       if (!lastEvent) {
-        request.log.warn("[EFI Webhook] Evento não encontrado nos detalhes.");
+        request.log.warn("[EFI Webhook] ⚠️ Nenhum evento encontrado nos detalhes da notificação.");
         return reply.code(400).send({ ok: false, message: "Dados da notificação vazios" });
       }
 
       // Na EFI, o subscription_id fica dentro de 'identifiers'
       // E o custom_id (que mandamos como invoiceId) fica na raiz do evento
       const events = notificationDetails.data || [];
+
+      // Mapear todos os status recebidos para o log
+      const allStatuses = events.map((e: any) => e.status?.current).join(", ");
+      request.log.info(`[EFI Webhook] 📊 Status recebidos na notificação: [${allStatuses}]`);
 
       // Verificar se há algum evento de pagamento confirmado nos dados
       const hasPaidEvent = events.some((e: any) =>
@@ -85,13 +85,13 @@ export async function efiRoutes(fastify: FastifyInstance) {
       const invoiceIdFromMetadata = lastEvent.custom_id;
 
       request.log.info(
-        `[EFI Webhook] Processando eventos para Assinatura ${subscription_id} (Ref: ${invoiceIdFromMetadata}). Pago: ${hasPaidEvent}, Ativo: ${hasActiveEvent}`
+        `[EFI Webhook] 🔍 Contexto: Assinatura ID=${subscription_id} | Referência (Invoice)=${invoiceIdFromMetadata} | Pago=${hasPaidEvent} | Ativo=${hasActiveEvent}`
       );
 
       // 2. Verificar se o status é pago OU ativo (para provisionamento antecipado)
       if (hasPaidEvent || hasActiveEvent) {
         request.log.info(
-          `[EFI Webhook] Status elegível para processamento. Buscando fatura...`
+          `[EFI Webhook] 🔎 Status elegível. Buscando fatura no banco local...`
         );
         // 3. Buscar os registros locais relacionados
         const invoice = await prisma.invoice.findFirst({
@@ -159,7 +159,10 @@ export async function efiRoutes(fastify: FastifyInstance) {
         const shouldProvision = hasPaidEvent && !company.databaseName;
 
         request.log.info(
-          `[EFI Webhook] Ação: Ativar Acesso? ${shouldActivateAccess} | Provisionar? ${shouldProvision}`
+          `[EFI Webhook] 🧠 Decisão Lógica: HasPaid=${hasPaidEvent} | DatabaseName='${company.databaseName || 'null'}'`
+        );
+        request.log.info(
+          `[EFI Webhook] 🎯 Ação Final: Ativar Acesso? ${shouldActivateAccess ? '✅ SIM' : '❌ NÃO'} | Provisionar Banco? ${shouldProvision ? '✅ SIM' : '❌ NÃO'}`
         );
 
         // 5. Atualizar banco de dados via Transação
@@ -211,7 +214,7 @@ export async function efiRoutes(fastify: FastifyInstance) {
             });
 
             request.log.info(
-              `[EFI Webhook] ACESSO LIBERADO: Empresa ${company.name} e Assinatura ${subscription.id} ATIVADOS.`
+              `[EFI Webhook] 🔓 ACESSO LIBERADO: Empresa ${company.name} e Assinatura ${subscription.id} ATIVADOS.`
             );
           }
         });
@@ -221,82 +224,88 @@ export async function efiRoutes(fastify: FastifyInstance) {
         if (shouldProvision) {
           try {
             request.log.info(
-              `[EFI Webhook] Iniciando PROVISIONAMENTO para ${company.name}...`
+              `[EFI Webhook] 🚀 Iniciando PROVISIONAMENTO para ${company.name}...`
             );
             const workerRes = await workerService.provisionDatabase(company.id);
             if (workerRes.ok) {
-              request.log.info(`[EFI Webhook] Provisionamento enfileirado no Worker.`);
+              request.log.info(`[EFI Webhook] ✅ Provisionamento enfileirado no Worker com sucesso.`);
             } else {
               request.log.error(
-                `[EFI Webhook] Erro ao enfileirar no Worker: ${workerRes.error}`
+                `[EFI Webhook] ❌ Erro ao enfileirar no Worker: ${workerRes.error}`
               );
             }
           } catch (err) {
-            request.log.error(`[EFI Webhook] EXCEÇÃO ao chamar Worker: ${err}`);
+            request.log.error(`[EFI Webhook] 💥 EXCEÇÃO ao chamar Worker: ${err}`);
           }
         }
 
-        // 7. Emissão automática de NFSe após pagamento (idempotente; dados vêm do banco tenant + core)
-        const nfseEmitenteCnpj = (process.env.NFSE_EMITENTE_CNPJ || "63132343000120")
-          .replace(/\D/g, "")
-          .padStart(14, "0")
-          .slice(-14);
-        const nfseEmitenteCompany = nfseEmitenteCnpj
-          ? await prisma.company.findFirst({
-              where: { cnpj: nfseEmitenteCnpj, databaseName: { not: null } },
-            })
-          : null;
-        const nfseCompanyId = nfseEmitenteCompany?.id || company.id;
-        if (
-          hasPaidEvent &&
-          !invoice.nfseEnqueuedAt &&
-          nfseCompanyId &&
-          (nfseEmitenteCompany ? true : !!company.databaseName)
-        ) {
-          try {
-            const nfseRes = await workerService.dispatchNFSe({
-              operation: "emitirAutoNFSe",
-              companyId: nfseCompanyId,
+        // 7. Emissão automática de NFSe após pagamento (desativado por enquanto - não funciona)
+        // const nfseEmitenteCnpj = (process.env.NFSE_EMITENTE_CNPJ || "63132343000120")
+        //   .replace(/\D/g, "")
+        //   .padStart(14, "0")
+        //   .slice(-14);
+        // const nfseEmitenteCompany = nfseEmitenteCnpj
+        //   ? await prisma.company.findFirst({
+        //       where: { cnpj: nfseEmitenteCnpj, databaseName: { not: null } },
+        //     })
+        //   : null;
+        // const nfseCompanyId = nfseEmitenteCompany?.id || company.id;
+        // if (
+        //   hasPaidEvent &&
+        //   !invoice.nfseEnqueuedAt &&
+        //   nfseCompanyId &&
+        //   (nfseEmitenteCompany ? true : !!company.databaseName)
+        // ) {
+        //   try {
+        //     const nfseRes = await workerService.dispatchNFSe({
+        //       operation: "emitirAutoNFSe",
+        //       companyId: nfseCompanyId,
+        //       invoiceId: invoice.id,
+        //     });
+        //     if (nfseRes.ok) {
+        //       await prisma.invoice.update({
+        //         where: { id: invoice.id },
+        //         data: { nfseEnqueuedAt: new Date() },
+        //       });
+        //       request.log.info(`[EFI Webhook] NFSe enfileirada para emissão e e-mail ao cliente.`);
+        //     } else {
+        //       request.log.error(`[EFI Webhook] Erro ao enfileirar NFSe: ${nfseRes.error}`);
+        //     }
+        //   } catch (err) {
+        //     request.log.error(`[EFI Webhook] EXCEÇÃO ao enfileirar NFSe: ${err}`);
+        //   }
+        // } else if (
+        //   hasPaidEvent &&
+        //   !invoice.nfseEnqueuedAt &&
+        //   !nfseEmitenteCompany &&
+        //   !company.databaseName
+        // ) {
+        //   request.log.info(
+        //     `[EFI Webhook] NFSe não enfileirada: tenant ainda não provisionado (company ${company.id}).`
+        //   );
+        // }
+
+        // 8. Marcar webhook como processado (idempotência) APENAS se tomamos alguma ação real
+        // Se entrou aqui só porque estava 'active' mas ainda não 'paid', não devemos queimar o token
+        if (shouldActivateAccess || shouldProvision) {
+          await prisma.efiWebhookProcessed.create({
+            data: {
+              notificationToken,
               invoiceId: invoice.id,
-            });
-            if (nfseRes.ok) {
-              await prisma.invoice.update({
-                where: { id: invoice.id },
-                data: { nfseEnqueuedAt: new Date() },
-              });
-              request.log.info(`[EFI Webhook] NFSe enfileirada para emissão e e-mail ao cliente.`);
-            } else {
-              request.log.error(`[EFI Webhook] Erro ao enfileirar NFSe: ${nfseRes.error}`);
-            }
-          } catch (err) {
-            request.log.error(`[EFI Webhook] EXCEÇÃO ao enfileirar NFSe: ${err}`);
-          }
-        } else if (
-          hasPaidEvent &&
-          !invoice.nfseEnqueuedAt &&
-          !nfseEmitenteCompany &&
-          !company.databaseName
-        ) {
-          request.log.info(
-            `[EFI Webhook] NFSe não enfileirada: tenant ainda não provisionado (company ${company.id}).`
-          );
+            },
+          });
+          request.log.info(`[EFI Webhook] 🔒 Processamento concluído com ações. Token de notificação salvo para idempotência.`);
+        } else {
+          request.log.info(`[EFI Webhook] ⏳ Nenhuma ação tomada (aguardando pagamento). Token não salvo para permitir retentativas/atualizações.`);
         }
-
-        // 8. Marcar webhook como processado (idempotência)
-        await prisma.efiWebhookProcessed.create({
-          data: {
-            notificationToken,
-            invoiceId: invoice.id,
-          },
-        });
 
         return reply.send({ ok: true });
       }
 
-      request.log.info(`[EFI Webhook] Eventos ignorados (Status irrelevantes).`);
+      request.log.info(`[EFI Webhook] 🛑 Eventos ignorados (Status irrelevantes para ativação).`);
       return reply.send({ ok: true, message: "Status ignorado" });
     } catch (error: any) {
-      request.log.error(`[EFI Webhook] ERRO CRÍTICO: ${JSON.stringify(error, null, 2)}`);
+      request.log.error(`[EFI Webhook] 🚨 ERRO CRÍTICO: ${JSON.stringify(error, null, 2)}`);
       return reply.code(500).send({
         ok: false,
         message: "Erro interno no processamento do webhook",

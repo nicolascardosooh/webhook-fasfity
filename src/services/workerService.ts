@@ -9,6 +9,7 @@ export interface NFSeEmitPayload {
 }
 
 export interface WorkerProvisionInput {
+  company_id: string; // ID da empresa no Core (para o Worker encontrar mesmo sem databaseName ainda)
   tenant_name: string; // slug (nome do banco/schema)
   admin_email: string;
   admin_password_hash: string;
@@ -31,13 +32,11 @@ export const workerService = {
     try {
       console.log(`[WorkerService] Conectando ao RabbitMQ em ${rabbitUrl}...`);
       const connection = await amqp.connect(rabbitUrl);
-      const channel = await connection.createChannel();
+      const channel = await connection.createConfirmChannel();
 
       const exchange = "infra.setup";
-      // const queue = "tenant.create.queue";
       const routingKey = "create-tenant";
 
-      // Garante que a exchange existe. A fila deve ser gerenciada pelo Worker para evitar conflitos de configuração.
       await channel.assertExchange(exchange, "direct", { durable: true });
 
       console.log(
@@ -51,14 +50,13 @@ export const workerService = {
         { persistent: true },
       );
 
+      if (!published) {
+        throw new Error("Falha ao publicar mensagem no RabbitMQ (buffer cheio?)");
+      }
+
+      await channel.waitForConfirms();
       await channel.close();
       await connection.close();
-
-      if (!published) {
-        throw new Error(
-          "Falha ao publicar mensagem no RabbitMQ (buffer cheio?)",
-        );
-      }
 
       console.log(
         `[WorkerService] Mensagem enviada com sucesso para o RabbitMQ.`,
@@ -99,44 +97,24 @@ export const workerService = {
         JSON.stringify(moduleKeys),
       );
 
-      // 1. Definir o nome do banco e senha se não existirem
+      // 1. Nome do banco e senha para o payload (só o Worker grava no Core ao concluir)
       let tenantName = company.databaseName;
       let tenantPass = company.databasePass;
-      let needsUpdate = false;
 
       if (!tenantName) {
-        // Gerar um slug simples a partir do nome ou ID
         const slug = company.name
           .toLowerCase()
           .normalize("NFD")
-          .replace(/[\u0300-\u036f]/g, "") // Remove acentos
-          .replace(/[^a-z0-z0-9]/g, "_") // Troca tudo que não é letra/número por _
+          .replace(/[\u0300-\u036f]/g, "")
+          .replace(/[^a-z0-z0-9]/g, "_")
           .substring(0, 20);
-
         tenantName = `db_${slug}_${company.id.substring(0, 4)}`;
-        needsUpdate = true;
       }
 
       if (!tenantPass) {
-        // Gerar uma senha aleatória segura
         tenantPass =
           Math.random().toString(36).slice(-8) +
           Math.random().toString(36).slice(-8);
-        needsUpdate = true;
-      }
-
-      if (needsUpdate) {
-        // SALVAR no banco principal antes de enviar para o Worker
-        await prisma.company.update({
-          where: { id: companyId },
-          data: {
-            databaseName: tenantName,
-            databasePass: tenantPass,
-          },
-        });
-        console.log(
-          `[WorkerService] Dados do banco definidos e salvos: ${tenantName}`,
-        );
       }
 
       // 2. Resolver nomes/chaves dos módulos (Auto-correção para incluir gratuitos e plano avançado)
@@ -185,6 +163,7 @@ export const workerService = {
 
       // 3. Montar payload
       const payload: WorkerProvisionInput = {
+        company_id: companyId,
         tenant_name: tenantName as string,
         admin_email: admin.email,
         admin_password_hash: admin.password,
@@ -206,8 +185,9 @@ export const workerService = {
         ),
       );
 
-      // 4. Despachar
-      return await workerService.dispatchProvision(payload);
+      // 4. Despachar para o RabbitMQ (só o Worker grava databaseName/databasePass no Core ao concluir)
+      const dispatchResult = await workerService.dispatchProvision(payload);
+      return dispatchResult;
     } catch (error) {
       console.error("[WorkerService] Erro no provisionamento:", error);
       return {
