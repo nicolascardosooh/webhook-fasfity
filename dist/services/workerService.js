@@ -1,12 +1,7 @@
-"use strict";
-var __importDefault = (this && this.__importDefault) || function (mod) {
-    return (mod && mod.__esModule) ? mod : { "default": mod };
-};
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.workerService = void 0;
-const amqplib_1 = __importDefault(require("amqplib"));
-const db_1 = require("../lib/db");
-exports.workerService = {
+import amqp from "amqplib";
+import { prisma } from "../lib/db.js";
+import { qualifyRabbitName } from "../lib/rabbitmqTopology.js";
+export const workerService = {
     dispatchProvision: async (data) => {
         const rabbitUrl = process.env.RABBITMQ_URL;
         if (!rabbitUrl) {
@@ -15,18 +10,19 @@ exports.workerService = {
         }
         try {
             console.log(`[WorkerService] Conectando ao RabbitMQ em ${rabbitUrl}...`);
-            const connection = await amqplib_1.default.connect(rabbitUrl);
-            const channel = await connection.createChannel();
-            const exchange = "infra.setup";
-            const routingKey = "create-tenant";
+            const connection = await amqp.connect(rabbitUrl);
+            const channel = await connection.createConfirmChannel();
+            const exchange = qualifyRabbitName("infra.setup");
+            const routingKey = qualifyRabbitName("create-tenant");
             await channel.assertExchange(exchange, "direct", { durable: true });
             console.log(`[WorkerService] Publicando provisionamento para ${data.tenant_name}...`);
             const published = channel.publish(exchange, routingKey, Buffer.from(JSON.stringify(data)), { persistent: true });
-            await channel.close();
-            await connection.close();
             if (!published) {
                 throw new Error("Falha ao publicar mensagem no RabbitMQ (buffer cheio?)");
             }
+            await channel.waitForConfirms();
+            await channel.close();
+            await connection.close();
             console.log(`[WorkerService] Mensagem enviada com sucesso para o RabbitMQ.`);
             return { ok: true };
         }
@@ -41,7 +37,7 @@ exports.workerService = {
     provisionDatabase: async (companyId) => {
         var _a, _b, _c, _d;
         try {
-            const company = await db_1.prisma.company.findUnique({
+            const company = await prisma.company.findUnique({
                 where: { id: companyId },
                 include: {
                     users: { where: { role: "ADMIN" }, take: 1 },
@@ -59,7 +55,6 @@ exports.workerService = {
             console.log(`[WorkerService] ModuleKeys encontrados:`, JSON.stringify(moduleKeys));
             let tenantName = company.databaseName;
             let tenantPass = company.databasePass;
-            let needsUpdate = false;
             if (!tenantName) {
                 const slug = company.name
                     .toLowerCase()
@@ -68,25 +63,13 @@ exports.workerService = {
                     .replace(/[^a-z0-z0-9]/g, "_")
                     .substring(0, 20);
                 tenantName = `db_${slug}_${company.id.substring(0, 4)}`;
-                needsUpdate = true;
             }
             if (!tenantPass) {
                 tenantPass =
                     Math.random().toString(36).slice(-8) +
                         Math.random().toString(36).slice(-8);
-                needsUpdate = true;
             }
-            if (needsUpdate) {
-                await db_1.prisma.company.update({
-                    where: { id: companyId },
-                    data: {
-                        databaseName: tenantName,
-                        databasePass: tenantPass,
-                    },
-                });
-                console.log(`[WorkerService] Dados do banco definidos e salvos: ${tenantName}`);
-            }
-            const allActiveModules = await db_1.prisma.management.findMany({
+            const allActiveModules = await prisma.management.findMany({
                 where: { active: true },
                 select: { id: true, name: true, key: true, priceCents: true },
             });
@@ -111,6 +94,7 @@ exports.workerService = {
             console.log(`[WorkerService] IDs consolidados (${consolidatedIds.length}):`, JSON.stringify(consolidatedIds));
             console.log(`[WorkerService] Módulos finais para o Worker:`, JSON.stringify(resolvedModules));
             const payload = {
+                company_id: companyId,
                 tenant_name: tenantName,
                 admin_email: admin.email,
                 admin_password_hash: admin.password,
@@ -123,10 +107,39 @@ exports.workerService = {
                 admin_password_hash: "***",
                 database_password: "***",
             }, null, 2));
-            return await exports.workerService.dispatchProvision(payload);
+            const dispatchResult = await workerService.dispatchProvision(payload);
+            return dispatchResult;
         }
         catch (error) {
             console.error("[WorkerService] Erro no provisionamento:", error);
+            return {
+                ok: false,
+                error: error instanceof Error ? error.message : "Erro desconhecido",
+            };
+        }
+    },
+    dispatchNFSe: async (payload) => {
+        const rabbitUrl = process.env.RABBITMQ_URL;
+        if (!rabbitUrl) {
+            console.warn("RABBITMQ_URL não configurada. Pulando despacho NFSe.");
+            return { ok: true, message: "RABBITMQ_URL não configurada (mock)" };
+        }
+        try {
+            const connection = await amqp.connect(rabbitUrl);
+            const channel = await connection.createChannel();
+            const exchange = qualifyRabbitName("docs.authorization");
+            const routingKey = qualifyRabbitName("nfse.process");
+            await channel.assertExchange(exchange, "direct", { durable: true });
+            const published = channel.publish(exchange, routingKey, Buffer.from(JSON.stringify(payload)), { persistent: true });
+            await channel.close();
+            await connection.close();
+            if (!published)
+                throw new Error("Falha ao publicar mensagem NFSe no RabbitMQ");
+            console.log("[WorkerService] NFSe publicada na fila com sucesso.");
+            return { ok: true };
+        }
+        catch (error) {
+            console.error("[WorkerService] Falha ao enviar NFSe para o RabbitMQ:", error);
             return {
                 ok: false,
                 error: error instanceof Error ? error.message : "Erro desconhecido",

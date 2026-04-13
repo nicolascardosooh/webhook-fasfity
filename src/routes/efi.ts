@@ -239,51 +239,52 @@ export async function efiRoutes(fastify: FastifyInstance) {
           }
         }
 
-        // 7. Emissão automática de NFSe após pagamento (desativado por enquanto - não funciona)
-        // const nfseEmitenteCnpj = (process.env.NFSE_EMITENTE_CNPJ || "63132343000120")
-        //   .replace(/\D/g, "")
-        //   .padStart(14, "0")
-        //   .slice(-14);
-        // const nfseEmitenteCompany = nfseEmitenteCnpj
-        //   ? await prisma.company.findFirst({
-        //       where: { cnpj: nfseEmitenteCnpj, databaseName: { not: null } },
-        //     })
-        //   : null;
-        // const nfseCompanyId = nfseEmitenteCompany?.id || company.id;
-        // if (
-        //   hasPaidEvent &&
-        //   !invoice.nfseEnqueuedAt &&
-        //   nfseCompanyId &&
-        //   (nfseEmitenteCompany ? true : !!company.databaseName)
-        // ) {
-        //   try {
-        //     const nfseRes = await workerService.dispatchNFSe({
-        //       operation: "emitirAutoNFSe",
-        //       companyId: nfseCompanyId,
-        //       invoiceId: invoice.id,
-        //     });
-        //     if (nfseRes.ok) {
-        //       await prisma.invoice.update({
-        //         where: { id: invoice.id },
-        //         data: { nfseEnqueuedAt: new Date() },
-        //       });
-        //       request.log.info(`[EFI Webhook] NFSe enfileirada para emissão e e-mail ao cliente.`);
-        //     } else {
-        //       request.log.error(`[EFI Webhook] Erro ao enfileirar NFSe: ${nfseRes.error}`);
-        //     }
-        //   } catch (err) {
-        //     request.log.error(`[EFI Webhook] EXCEÇÃO ao enfileirar NFSe: ${err}`);
-        //   }
-        // } else if (
-        //   hasPaidEvent &&
-        //   !invoice.nfseEnqueuedAt &&
-        //   !nfseEmitenteCompany &&
-        //   !company.databaseName
-        // ) {
-        //   request.log.info(
-        //     `[EFI Webhook] NFSe não enfileirada: tenant ainda não provisionado (company ${company.id}).`
-        //   );
-        // }
+        // 7. Emissão automática de NFSe após pagamento (prestador = empresa emitente Tech Pozz no core)
+        const nfseEmitenteCnpj = (process.env.NFSE_EMITENTE_CNPJ || "63132343000120")
+          .replace(/\D/g, "")
+          .padStart(14, "0")
+          .slice(-14);
+        const nfseEmitenteCompany = nfseEmitenteCnpj
+          ? await prisma.company.findFirst({
+              where: { cnpj: nfseEmitenteCnpj, databaseName: { not: null } },
+            })
+          : null;
+        const nfseCompanyId = nfseEmitenteCompany?.id || company.id;
+        if (
+          hasPaidEvent &&
+          !invoice.nfseEnqueuedAt &&
+          nfseCompanyId &&
+          (nfseEmitenteCompany ? true : !!company.databaseName)
+        ) {
+          try {
+            const nfseRes = await workerService.dispatchNFSe({
+              operation: "emitirAutoNFSe",
+              companyId: nfseCompanyId,
+              invoiceId: invoice.id,
+              includeWelcome: shouldProvision,
+            });
+            if (nfseRes.ok) {
+              await prisma.invoice.update({
+                where: { id: invoice.id },
+                data: { nfseEnqueuedAt: new Date() },
+              });
+              request.log.info(`[EFI Webhook] NFSe enfileirada para emissão e e-mail ao cliente.`);
+            } else {
+              request.log.error(`[EFI Webhook] Erro ao enfileirar NFSe: ${nfseRes.error}`);
+            }
+          } catch (err) {
+            request.log.error(`[EFI Webhook] EXCEÇÃO ao enfileirar NFSe: ${err}`);
+          }
+        } else if (
+          hasPaidEvent &&
+          !invoice.nfseEnqueuedAt &&
+          !nfseEmitenteCompany &&
+          !company.databaseName
+        ) {
+          request.log.info(
+            `[EFI Webhook] NFSe não enfileirada: tenant ainda não provisionado (company ${company.id}).`
+          );
+        }
 
         // 8. Marcar webhook como processado (idempotência) APENAS se tomamos alguma ação real
         // Se entrou aqui só porque estava 'active' mas ainda não 'paid', não devemos queimar o token

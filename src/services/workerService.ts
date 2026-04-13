@@ -1,11 +1,14 @@
 import amqp from "amqplib";
 import { prisma } from "../lib/db.js";
+import { qualifyRabbitName } from "../lib/rabbitmqTopology.js";
 
 /** Payload enviado na fila para emissão automática de NFSe (pagamento). Dados vêm do banco (core + tenant). */
 export interface NFSeEmitPayload {
   operation: "emitirAutoNFSe";
   companyId: string;
   invoiceId: string;
+  /** true quando é primeiro provisionamento: um e-mail com boas-vindas + NFS-e (se autorizada). */
+  includeWelcome?: boolean;
 }
 
 export interface WorkerProvisionInput {
@@ -34,8 +37,8 @@ export const workerService = {
       const connection = await amqp.connect(rabbitUrl);
       const channel = await connection.createConfirmChannel();
 
-      const exchange = "infra.setup";
-      const routingKey = "create-tenant";
+      const exchange = qualifyRabbitName("infra.setup");
+      const routingKey = qualifyRabbitName("create-tenant");
 
       await channel.assertExchange(exchange, "direct", { durable: true });
 
@@ -207,8 +210,8 @@ export const workerService = {
     try {
       const connection = await amqp.connect(rabbitUrl);
       const channel = await connection.createChannel();
-      const exchange = "docs.authorization";
-      const routingKey = "nfse.process";
+      const exchange = qualifyRabbitName("docs.authorization");
+      const routingKey = qualifyRabbitName("nfse.process");
       await channel.assertExchange(exchange, "direct", { durable: true });
       const published = channel.publish(
         exchange,

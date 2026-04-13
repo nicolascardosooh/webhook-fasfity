@@ -1,9 +1,6 @@
-"use strict";
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.efiService = void 0;
-const efi_1 = require("../lib/efi");
+import { getEfiInstance, cleanDocument } from "../lib/efi.js";
 const formatCustomer = (customer) => {
-    const doc = (0, efi_1.cleanDocument)(customer.cpf);
+    const doc = cleanDocument(customer.cpf);
     if (doc.length === 14) {
         return {
             juridical_person: {
@@ -11,7 +8,7 @@ const formatCustomer = (customer) => {
                 cnpj: doc,
             },
             email: customer.email,
-            phone_number: (0, efi_1.cleanDocument)(customer.phone_number),
+            phone_number: cleanDocument(customer.phone_number),
         };
     }
     else {
@@ -19,7 +16,7 @@ const formatCustomer = (customer) => {
             name: customer.name,
             cpf: doc,
             email: customer.email,
-            phone_number: (0, efi_1.cleanDocument)(customer.phone_number),
+            phone_number: cleanDocument(customer.phone_number),
         };
         if (customer.birth) {
             customerPF.birth = customer.birth;
@@ -27,9 +24,9 @@ const formatCustomer = (customer) => {
         return customerPF;
     }
 };
-exports.efiService = {
+export const efiService = {
     createPlan: async (plan) => {
-        const efi = (0, efi_1.getEfiInstance)();
+        const efi = getEfiInstance();
         try {
             const params = {};
             const body = {
@@ -54,7 +51,7 @@ exports.efiService = {
         }
     },
     createSubscription: async (input) => {
-        const efi = (0, efi_1.getEfiInstance)();
+        const efi = getEfiInstance();
         try {
             const params = {
                 id: input.plan_id,
@@ -78,7 +75,7 @@ exports.efiService = {
         }
     },
     paySubscriptionCreditCard: async (subscriptionId, payment) => {
-        const efi = (0, efi_1.getEfiInstance)();
+        const efi = getEfiInstance();
         const params = {
             id: subscriptionId,
         };
@@ -94,7 +91,7 @@ exports.efiService = {
                         neighborhood: payment.billing_address.neighborhood,
                         city: payment.billing_address.city,
                         state: payment.billing_address.state,
-                        zipcode: (0, efi_1.cleanDocument)(payment.billing_address.zipcode),
+                        zipcode: cleanDocument(payment.billing_address.zipcode),
                     },
                     payment_token: payment.payment_token,
                 },
@@ -111,7 +108,7 @@ exports.efiService = {
         }
     },
     paySubscriptionBankingBillet: async (subscriptionId, payment) => {
-        const efi = (0, efi_1.getEfiInstance)();
+        const efi = getEfiInstance();
         const params = {
             id: subscriptionId,
         };
@@ -138,7 +135,7 @@ exports.efiService = {
         }
     },
     getSubscription: async (subscriptionId) => {
-        const efi = (0, efi_1.getEfiInstance)();
+        const efi = getEfiInstance();
         const params = {
             id: subscriptionId,
         };
@@ -152,7 +149,7 @@ exports.efiService = {
         }
     },
     getNotification: async (token) => {
-        const efi = (0, efi_1.getEfiInstance)();
+        const efi = getEfiInstance();
         const params = {
             token: token,
         };

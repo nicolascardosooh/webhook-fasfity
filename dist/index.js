@@ -1,19 +1,45 @@
-"use strict";
-var __importDefault = (this && this.__importDefault) || function (mod) {
-    return (mod && mod.__esModule) ? mod : { "default": mod };
-};
-Object.defineProperty(exports, "__esModule", { value: true });
-const fastify_1 = __importDefault(require("fastify"));
-const formbody_1 = __importDefault(require("@fastify/formbody"));
-const efi_1 = require("./routes/efi");
-const fastify = (0, fastify_1.default)({
-    logger: true,
+var _a;
+import "dotenv/config";
+import Fastify from "fastify";
+import formBody from "@fastify/formbody";
+import { efiRoutes } from "./routes/efi.js";
+import { controlpayRoutes } from "./routes/controlpay.js";
+const usePrettyLogs = process.env.NODE_ENV !== "production" && process.env.LOG_JSON !== "1";
+const fastify = Fastify({
+    logger: usePrettyLogs
+        ? {
+            level: (_a = process.env.LOG_LEVEL) !== null && _a !== void 0 ? _a : "info",
+            transport: {
+                target: "pino-pretty",
+                options: {
+                    colorize: true,
+                    translateTime: "HH:MM:ss",
+                    ignore: "pid,hostname",
+                },
+            },
+        }
+        : { level: "info" },
 });
-fastify.register(formbody_1.default);
+fastify.removeContentTypeParser("application/json");
+fastify.addContentTypeParser("application/json", { parseAs: "string" }, function (_req, body, done) {
+    const raw = typeof body === "string" ? body : String(body !== null && body !== void 0 ? body : "");
+    if (raw.trim() === "") {
+        done(null, {});
+        return;
+    }
+    try {
+        done(null, JSON.parse(raw));
+    }
+    catch (e) {
+        done(e, undefined);
+    }
+});
+fastify.register(formBody);
 fastify.get("/health", async () => {
     return { ok: true, message: "webhooks-fastify está rodando" };
 });
-fastify.register(efi_1.efiRoutes);
+fastify.register(efiRoutes, { prefix: "/api" });
+fastify.register(controlpayRoutes, { prefix: "/api" });
 async function start() {
     try {
         const port = 4000;
