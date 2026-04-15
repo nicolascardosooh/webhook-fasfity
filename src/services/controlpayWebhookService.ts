@@ -8,7 +8,14 @@ import {
 import type { TenantPrismaClient } from "@repo/db";
 
 function pickPagamentoExternoId(intencao: Record<string, unknown>): string | null {
-  const arr = intencao.pagamentosExternos;
+  const direct =
+    intencao.pagamentoExternoId ??
+    intencao.PagamentoExternoId ??
+    intencao.idPagamentoExterno;
+  if (direct != null && String(direct).trim() !== "") return String(direct);
+
+  const arr = (intencao.pagamentosExternos ??
+    intencao.PagamentosExternos) as unknown;
   if (!Array.isArray(arr) || arr.length === 0) return null;
   const first = arr[0] as Record<string, unknown>;
   if (first?.id != null) return String(first.id);
@@ -23,12 +30,103 @@ function pickAutorizacaoNsu(
       ? String(pagamentoJson.nsuTid)
       : pagamentoJson.trnNsu != null
         ? String(pagamentoJson.trnNsu)
-        : null;
+        : pagamentoJson.nsu != null
+          ? String(pagamentoJson.nsu)
+          : pagamentoJson.NSU != null
+            ? String(pagamentoJson.NSU)
+            : null;
   const autorizacao =
     pagamentoJson.autorizacao != null
       ? String(pagamentoJson.autorizacao)
-      : null;
+      : pagamentoJson.codigoAutorizacao != null
+        ? String(pagamentoJson.codigoAutorizacao)
+        : pagamentoJson.numeroAutorizacao != null
+          ? String(pagamentoJson.numeroAutorizacao)
+          : null;
   return { nsu, autorizacao };
+}
+
+function pickAdquirenteNome(
+  pagamentoJson: Record<string, unknown>,
+): string | null {
+  const direct =
+    pagamentoJson.adquirente ?? pagamentoJson.Adquirente;
+  if (direct != null && String(direct).trim() !== "") {
+    return String(direct).trim();
+  }
+  const resposta = pagamentoJson.respostaAdquirente;
+  if (typeof resposta === "string") {
+    const m = resposta.match(/PWINFO_AUTHSYST\s*=\s*([^\r\n]+)/i);
+    if (m?.[1]) return m[1].trim();
+  }
+  return null;
+}
+
+/** Último recurso: acha adquirente em qualquer aninhamento do snapshot serializado. */
+function pickAdquirenteFromSnapshotBlob(
+  snapshot: Record<string, unknown>,
+): string | null {
+  try {
+    const s = JSON.stringify(snapshot);
+    const quoted = s.match(/"adquirente"\s*:\s*"([^"\\]*)"/i);
+    if (quoted?.[1]?.trim()) return quoted[1].trim();
+    const m = s.match(/PWINFO_AUTHSYST\s*=\s*([^\r\n"\\]+)/i);
+    if (m?.[1]?.trim()) return m[1].trim();
+  } catch {
+    /* ignore */
+  }
+  return null;
+}
+
+const LOG_PREFIX = "[controlpay-hydrate]";
+
+function logHydrate(msg: string, extra?: Record<string, unknown>): void {
+  if (extra && Object.keys(extra).length > 0) {
+    console.info(LOG_PREFIX, msg, extra);
+  } else {
+    console.info(LOG_PREFIX, msg);
+  }
+}
+
+/** Variações comuns de idTransacao (número vs string, zeros). */
+function idTransacaoWhereVariants(intencaoId: string): string[] {
+  const s = String(intencaoId).trim();
+  const out = new Set<string>([s]);
+  if (/^\d+$/.test(s)) {
+    out.add(String(Number(s)));
+  }
+  return [...out];
+}
+
+/**
+ * PagamentoExterno/GetById costuma vir como folha ou embrulhado em
+ * `{ pagamentoExterno: { ... } }` (às vezes duas vezes). Os campos NSU,
+ * autorização e adquirente ficam só no objeto folha.
+ */
+function leafPagamentoExternoRecord(
+  root: Record<string, unknown> | undefined,
+): Record<string, unknown> | undefined {
+  if (!root || typeof root !== "object" || Array.isArray(root)) return undefined;
+  let cur: Record<string, unknown> = root;
+  const data = cur.data;
+  if (
+    data &&
+    typeof data === "object" &&
+    !Array.isArray(data) &&
+    ("pagamentoExterno" in (data as object) ||
+      "PagamentoExterno" in (data as object) ||
+      "adquirente" in (data as object))
+  ) {
+    cur = data as Record<string, unknown>;
+  }
+  for (let d = 0; d < 5; d++) {
+    const nested =
+      (cur.pagamentoExterno as Record<string, unknown> | undefined) ??
+      (cur.PagamentoExterno as Record<string, unknown> | undefined);
+    if (!nested || typeof nested !== "object" || Array.isArray(nested)) break;
+    cur = nested;
+  }
+  return cur;
 }
 
 function pickBandeira(
@@ -73,9 +171,10 @@ async function findVendaFromTefIntencao(
   tenant: TenantPrismaClient,
   intencaoVendaId: string,
 ): Promise<{ vendaId: string; pagamentoVendaId: string } | null> {
+  const variants = idTransacaoWhereVariants(intencaoVendaId);
   const pag = await tenant.pagamentoVenda.findFirst({
     where: {
-      idTransacao: intencaoVendaId,
+      idTransacao: { in: variants },
       formaPagamento: "TEF",
     },
     select: { id: true, vendaId: true },
@@ -89,7 +188,7 @@ export async function processControlPayHydration(args: {
   eventId: string;
   coreCompanyId: string;
 }) {
-  const { tenant, eventId } = args;
+  const { tenant, eventId, coreCompanyId } = args;
 
   const ev = await tenant.controlPayWebhookEvent.findUnique({
     where: { id: eventId },
@@ -104,6 +203,10 @@ export async function processControlPayHydration(args: {
   });
 
   if (!tefCfg?.controlpayIntegrationKey) {
+    logHydrate("abort: sem controlpayIntegrationKey na ConfiguracaoTef", {
+      eventId,
+      coreCompanyId,
+    });
     await tenant.controlPayWebhookEvent.update({
       where: { id: eventId },
       data: {
@@ -124,6 +227,7 @@ export async function processControlPayHydration(args: {
 
   const intencaoId = ev.intencaoVendaId;
   if (!intencaoId) {
+    logHydrate("abort: evento sem intencaoVendaId", { eventId, coreCompanyId });
     await tenant.controlPayWebhookEvent.update({
       where: { id: eventId },
       data: {
@@ -135,6 +239,11 @@ export async function processControlPayHydration(args: {
   }
 
   try {
+    logHydrate("início consulta API", {
+      eventId,
+      coreCompanyId,
+      intencaoVendaId: intencaoId,
+    });
     const raw = await client.intencaoVendaGetById(intencaoId);
     const { intencao, statusId, statusNome } =
       extractIntencaoFromGetByIdResponse(raw);
@@ -148,10 +257,24 @@ export async function processControlPayHydration(args: {
       try {
         const pe = await client.pagamentoExternoGetById(pagamentoExternoId);
         snapshot = { ...raw, pagamentoExterno: pe };
+        logHydrate("PagamentoExterno/GetById ok", {
+          eventId,
+          pagamentoExternoId,
+        });
       } catch (e) {
         snapshot.pagamentoExternoErro =
           e instanceof Error ? e.message : "erro PagamentoExterno";
+        logHydrate("PagamentoExterno/GetById falhou", {
+          eventId,
+          pagamentoExternoId,
+          erro: snapshot.pagamentoExternoErro,
+        });
       }
+    } else {
+      logHydrate("sem pagamentoExternoId na intenção (só intencao/GetById)", {
+        eventId,
+        intencaoVendaId: intencaoId,
+      });
     }
 
     let vendaId: string | null = ev.vendaId;
@@ -193,19 +316,64 @@ export async function processControlPayHydration(args: {
 
     const finalOk = isLikelyIntencaoFinalizadaSucesso(statusId, statusNome);
     const pgExt = snapshot.pagamentoExterno as Record<string, unknown> | undefined;
-    const pePayload =
-      pgExt && typeof pgExt === "object"
-        ? (pgExt.pagamentoExterno as Record<string, unknown> | undefined) ??
-          pgExt
-        : undefined;
+    const pePayload = leafPagamentoExternoRecord(pgExt);
 
-    if (vendaId && intencaoId && finalOk && pePayload && typeof pePayload === "object") {
-      const { nsu, autorizacao } = pickAutorizacaoNsu(pePayload);
-      const bandeira = pickBandeira(pePayload);
-      const nfceTPag = pickNfceTPag(pePayload);
+    const intencaoFlat =
+      intencao && typeof intencao === "object"
+        ? (intencao as Record<string, unknown>)
+        : null;
+
+    /** Mescla intenção + PagamentoExterno (folha): NSU, autorização, adquirente, bandeira. */
+    const mergedForNfce: Record<string, unknown> = {
+      ...(intencaoFlat ?? {}),
+      ...(pePayload ?? {}),
+    };
+
+    let adquirenteNome = pickAdquirenteNome(mergedForNfce);
+    if (!adquirenteNome) {
+      adquirenteNome = pickAdquirenteFromSnapshotBlob(snapshot);
+    }
+
+    logHydrate("após merge snapshot", {
+      eventId,
+      vendaId,
+      intencaoVendaId: intencaoId,
+      statusId,
+      statusNome,
+      finalOk,
+      pagamentoExternoId,
+      temPeLeaf: !!pePayload,
+      chavesPeLeaf: pePayload ? Object.keys(pePayload).slice(0, 25) : [],
+      adquirenteExtraida: adquirenteNome ?? null,
+    });
+
+    /**
+     * Grava PagamentoVenda sempre que houver vínculo com a venda — não exige mais
+     * `finalOk`, porque o webhook pode chegar antes do GetById marcar "Creditado",
+     * e o snapshot já traz adquirente/NSU no PagamentoExterno.
+     */
+    if (vendaId && intencaoId) {
+      const idVariants = idTransacaoWhereVariants(intencaoId);
       const tefRows = await tenant.pagamentoVenda.findMany({
-        where: { vendaId, idTransacao: intencaoId, formaPagamento: "TEF" },
+        where: {
+          vendaId,
+          formaPagamento: "TEF",
+          idTransacao: { in: idVariants },
+        },
       });
+
+      if (tefRows.length === 0) {
+        logHydrate("Nenhum PagamentoVenda TEF encontrado para intenção (idTransacao)", {
+          eventId,
+          vendaId,
+          intencaoVendaId: intencaoId,
+          idVariants,
+        });
+      }
+
+      const { nsu, autorizacao } = pickAutorizacaoNsu(mergedForNfce);
+      const bandeira = pickBandeira(mergedForNfce);
+      const nfceTPag = pickNfceTPag(mergedForNfce);
       const nfceObsToken = `NFCE_TPag=${nfceTPag}`;
       for (const row of tefRows) {
         const obsBase = (row.observacoes ?? "").trim();
@@ -215,20 +383,49 @@ export async function processControlPayHydration(args: {
             : obsBase
               ? `${obsBase} | ${nfceObsToken}`
               : nfceObsToken;
+        const adquirenteGravar =
+          adquirenteNome != null && String(adquirenteNome).trim() !== ""
+            ? String(adquirenteNome).trim()
+            : row.adquirente ?? undefined;
+
         await tenant.pagamentoVenda.update({
           where: { id: row.id },
           data: {
             nsu: nsu ?? row.nsu ?? undefined,
             autorizacao: autorizacao ?? row.autorizacao ?? undefined,
             bandeira: bandeira ?? row.bandeira ?? undefined,
+            ...(adquirenteGravar != null && adquirenteGravar !== ""
+              ? { adquirente: adquirenteGravar }
+              : {}),
             pagamentoExternoId: pagamentoExternoId ?? row.pagamentoExternoId ?? undefined,
             controlPayTokenNotificacao: ev.tokenNotificacao ?? undefined,
             observacoes: obs,
           },
         });
+
+        logHydrate("PagamentoVenda atualizado", {
+          eventId,
+          pagamentoVendaId: row.id,
+          nsu: nsu ?? row.nsu ?? null,
+          temAutorizacao: !!(autorizacao ?? row.autorizacao),
+          bandeira: bandeira ?? row.bandeira ?? null,
+          adquirente: adquirenteGravar ?? null,
+          finalOk,
+        });
       }
+    } else {
+      logHydrate("skip gravar PagamentoVenda: falta vendaId ou intencaoId", {
+        eventId,
+        vendaId,
+        intencaoVendaId: intencaoId,
+      });
     }
   } catch (e) {
+    logHydrate("erro na consulta/hidratação", {
+      eventId,
+      coreCompanyId,
+      erro: e instanceof Error ? e.message : String(e),
+    });
     await tenant.controlPayWebhookEvent.update({
       where: { id: eventId },
       data: {
@@ -294,10 +491,11 @@ export async function createControlPayWebhookEventAndScheduleHydrate(args: {
   }
 
   if (vendaId && extracted.intencaoVendaId && !pagamentoVendaId) {
+    const idVars = idTransacaoWhereVariants(extracted.intencaoVendaId);
     const pag = await args.tenant.pagamentoVenda.findFirst({
       where: {
         vendaId,
-        idTransacao: extracted.intencaoVendaId,
+        idTransacao: { in: idVars },
         formaPagamento: "TEF",
       },
       select: { id: true },
