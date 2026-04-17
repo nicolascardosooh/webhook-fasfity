@@ -216,5 +216,18 @@ export const efiService = {
         console.error("Erro ao obter notificação EFI:", error);
         throw error;
     }
-  }
+  },
+
+  /** Encerra assinatura na EFI (ex.: pacote extra avulso após primeiro pagamento). */
+  cancelSubscription: async (subscriptionId: number) => {
+    const efi = getEfiInstance();
+    const params = { id: subscriptionId };
+    try {
+      const response = await efi.cancelSubscription(params);
+      return response;
+    } catch (error) {
+      console.error("Erro ao cancelar assinatura EFI:", error);
+      throw error;
+    }
+  },
 };

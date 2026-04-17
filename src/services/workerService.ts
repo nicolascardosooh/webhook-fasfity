@@ -1,6 +1,41 @@
 import amqp from "amqplib";
+import type { Channel } from "amqplib";
 import { prisma } from "../lib/db.js";
 import { qualifyRabbitName } from "../lib/rabbitmqTopology.js";
+
+/**
+ * Igual a `Worker/src/lib/rabbitmq` (assertTopology) + `buildFiscalExtraCreditQueueConfig`.
+ * Só publicar no exchange sem fila ligada faz o RabbitMQ descartar a mensagem (Worker não recebe).
+ */
+async function assertFiscalExtraCreditTopology(ch: Channel): Promise<void> {
+  const exchange = qualifyRabbitName("infra.setup");
+  const queue = qualifyRabbitName("fiscal.extra.credit.queue");
+  const routingKey = qualifyRabbitName("fiscal-extra.credit");
+  const retryQueue = qualifyRabbitName("fiscal.extra.credit.retry");
+  const retryRoutingKey = qualifyRabbitName("fiscal.extra.credit.retry");
+  const dlqQueue = qualifyRabbitName("fiscal.extra.credit.dlq");
+  const dlqRoutingKey = qualifyRabbitName("fiscal.extra.credit.dlq");
+
+  await ch.assertExchange(exchange, "direct", { durable: true });
+
+  await ch.assertQueue(queue, {
+    durable: true,
+    deadLetterExchange: exchange,
+    deadLetterRoutingKey: dlqRoutingKey,
+  });
+  await ch.bindQueue(queue, exchange, routingKey);
+
+  await ch.assertQueue(retryQueue, {
+    durable: true,
+    messageTtl: 30000,
+    deadLetterExchange: exchange,
+    deadLetterRoutingKey: routingKey,
+  });
+  await ch.bindQueue(retryQueue, exchange, retryRoutingKey);
+
+  await ch.assertQueue(dlqQueue, { durable: true });
+  await ch.bindQueue(dlqQueue, exchange, dlqRoutingKey);
+}
 
 /** Payload enviado na fila para emissão automática de NFSe (pagamento). Dados vêm do banco (core + tenant). */
 export interface NFSeEmitPayload {
@@ -9,6 +44,14 @@ export interface NFSeEmitPayload {
   invoiceId: string;
   /** true quando é primeiro provisionamento: um e-mail com boas-vindas + NFS-e (se autorizada). */
   includeWelcome?: boolean;
+}
+
+export interface FiscalExtraCreditPayload {
+  operation: "creditFiscalExtraPack";
+  companyId: string;
+  coreOrderId: string;
+  documentModel: "NFCE" | "NFE" | "MDFE";
+  eventsGranted: number;
 }
 
 export interface WorkerProvisionInput {
@@ -226,6 +269,64 @@ export const workerService = {
       return { ok: true };
     } catch (error) {
       console.error("[WorkerService] Falha ao enviar NFSe para o RabbitMQ:", error);
+      return {
+        ok: false,
+        error: error instanceof Error ? error.message : "Erro desconhecido",
+      };
+    }
+  },
+
+  dispatchFiscalExtraCredit: async (payload: FiscalExtraCreditPayload) => {
+    const rabbitUrl = process.env.RABBITMQ_URL;
+    if (!rabbitUrl) {
+      console.warn(
+        "RABBITMQ_URL não configurada. Pulando crédito de pacote fiscal.",
+      );
+      return { ok: false, error: "RABBITMQ_URL não configurada" };
+    }
+    try {
+      const connection = await amqp.connect(rabbitUrl);
+      const channel = await connection.createConfirmChannel();
+      await assertFiscalExtraCreditTopology(channel);
+
+      const exchange = qualifyRabbitName("infra.setup");
+      const routingKey = qualifyRabbitName("fiscal-extra.credit");
+
+      let unroutable = false;
+      channel.on("return", () => {
+        unroutable = true;
+      });
+
+      const published = channel.publish(
+        exchange,
+        routingKey,
+        Buffer.from(JSON.stringify(payload)),
+        { persistent: true, mandatory: true },
+      );
+      if (!published) {
+        throw new Error(
+          "Falha ao publicar crédito fiscal extra no RabbitMQ (buffer cheio?)",
+        );
+      }
+
+      await channel.waitForConfirms();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      await channel.close();
+      await connection.close();
+
+      if (unroutable) {
+        throw new Error(
+          "Mensagem fiscal-extra devolvida pelo broker (sem rota para fila).",
+        );
+      }
+
+      console.log("[WorkerService] Crédito pacote fiscal publicado na fila.");
+      return { ok: true };
+    } catch (error) {
+      console.error(
+        "[WorkerService] Falha ao enviar crédito fiscal extra:",
+        error,
+      );
       return {
         ok: false,
         error: error instanceof Error ? error.message : "Erro desconhecido",

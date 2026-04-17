@@ -74,34 +74,150 @@ export async function efiRoutes(fastify: FastifyInstance) {
 
       // Verificar se há algum evento de pagamento confirmado nos dados
       const hasPaidEvent = events.some((e: any) =>
-        ["paid", "settled"].includes(e.status.current)
+        ["paid", "settled"].includes(e.status?.current)
       );
       // Verificar se a assinatura foi marcada como ativa
       const hasActiveEvent = events.some(
-        (e: any) => e.status.current === "active" && e.type === "subscription" // Verifique se 'type' existe no evento real, o código original usava isso
+        (e: any) => e.status?.current === "active" && e.type === "subscription"
       );
 
       const subscription_id = lastEvent.identifiers?.subscription_id;
+      const pickChargeId = (): number | undefined => {
+        for (const e of events) {
+          const raw =
+            e?.identifiers?.charge_id ??
+            e?.identifiers?.chargeId ??
+            e?.charge_id;
+          const n = Number(raw);
+          if (Number.isFinite(n)) return n;
+        }
+        return undefined;
+      };
+      const charge_id = pickChargeId();
       const invoiceIdFromMetadata = lastEvent.custom_id;
 
       request.log.info(
-        `[EFI Webhook] 🔍 Contexto: Assinatura ID=${subscription_id} | Referência (Invoice)=${invoiceIdFromMetadata} | Pago=${hasPaidEvent} | Ativo=${hasActiveEvent}`
+        `[EFI Webhook] 🔍 Contexto: subscription_id=${subscription_id} | charge_id=${charge_id} | custom_id=${invoiceIdFromMetadata} | Pago=${hasPaidEvent} | Ativo=${hasActiveEvent}`
       );
 
       // 2. Verificar se o status é pago OU ativo (para provisionamento antecipado)
       if (hasPaidEvent || hasActiveEvent) {
+        const customRef =
+          invoiceIdFromMetadata != null ? String(invoiceIdFromMetadata) : "";
+
+        // Pacote extra fiscal: custom_id = fpx_<uuid> (legado homolog: fpx:)
+        if (customRef.startsWith("fpx_") || customRef.startsWith("fpx:")) {
+          if (!hasPaidEvent) {
+            request.log.info(
+              `[EFI Webhook] fpx aguardando confirmação de pagamento (${customRef})`,
+            );
+            return reply.send({ ok: true, message: "Aguardando pagamento" });
+          }
+
+          const packOrder = await prisma.fiscalExtraPackOrder.findFirst({
+            where: { efiCustomId: customRef },
+          });
+
+          if (!packOrder) {
+            request.log.warn(
+              `[EFI Webhook] Pedido pacote extra não encontrado: ${customRef}`,
+            );
+            return reply.send({
+              ok: true,
+              message: "fpx não encontrado localmente",
+            });
+          }
+
+          const extraInvoice = await prisma.invoice.findFirst({
+            where: { fiscalExtraPackOrderId: packOrder.id },
+          });
+
+          if (!extraInvoice) {
+            request.log.error(
+              `[EFI Webhook] fpx sem Invoice para pedido ${packOrder.id}`,
+            );
+            return reply.code(404).send({ ok: false, message: "Fatura extra não encontrada" });
+          }
+
+          await prisma.$transaction(async (tx) => {
+            await tx.fiscalExtraPackOrder.update({
+              where: { id: packOrder.id },
+              data: { status: "paid", paidAt: new Date() },
+            });
+            await tx.invoice.update({
+              where: { id: extraInvoice.id },
+              data: { status: "paid", paidAt: new Date() },
+            });
+            await tx.payment.updateMany({
+              where: { invoiceId: extraInvoice.id },
+              data: { status: "captured", updatedAt: new Date() },
+            });
+          });
+
+          if (!packOrder.webhookCreditedAt) {
+            const creditRes = await workerService.dispatchFiscalExtraCredit({
+              operation: "creditFiscalExtraPack",
+              companyId: packOrder.companyId,
+              coreOrderId: packOrder.id,
+              documentModel: packOrder.documentModel as "NFCE" | "NFE" | "MDFE",
+              eventsGranted: packOrder.eventsGranted,
+            });
+            if (!creditRes.ok) {
+              request.log.error(
+                `[EFI Webhook] Falha ao enfileirar crédito fiscal extra: ${creditRes.error}`,
+              );
+              return reply.code(500).send({
+                ok: false,
+                message: "Falha ao enfileirar crédito do pacote",
+              });
+            }
+          }
+
+          await prisma.efiWebhookProcessed.create({
+            data: {
+              notificationToken,
+              invoiceId: extraInvoice.id,
+            },
+          });
+          request.log.info(
+            `[EFI Webhook] Pacote extra pago e crédito enfileirado: ${packOrder.id}`,
+          );
+          return reply.send({ ok: true });
+        }
+
         request.log.info(
           `[EFI Webhook] 🔎 Status elegível. Buscando fatura no banco local...`
         );
         // 3. Buscar os registros locais relacionados
+        const invoiceOr: Array<Record<string, unknown>> = [];
+        if (invoiceIdFromMetadata && typeof invoiceIdFromMetadata === "string") {
+          invoiceOr.push({ id: invoiceIdFromMetadata });
+        }
+        if (subscription_id != null && String(subscription_id) !== "undefined") {
+          invoiceOr.push({ externalId: String(subscription_id) });
+          invoiceOr.push({
+            payments: { some: { gatewayRef: String(subscription_id) } },
+          });
+        }
+        if (charge_id != null && Number.isFinite(charge_id)) {
+          invoiceOr.push({ externalId: String(charge_id) });
+          invoiceOr.push({
+            payments: { some: { efiChargeId: String(charge_id) } },
+          });
+        }
+
+        if (invoiceOr.length === 0) {
+          request.log.warn(
+            "[EFI Webhook] Nenhum identificador (custom_id, subscription_id, charge_id) para localizar fatura.",
+          );
+          return reply.send({
+            ok: true,
+            message: "Notificação sem referência local",
+          });
+        }
+
         const invoice = await prisma.invoice.findFirst({
-          where: {
-            OR: [
-              { id: invoiceIdFromMetadata },
-              { externalId: String(subscription_id) },
-              { payments: { some: { gatewayRef: String(subscription_id) } } },
-            ],
-          },
+          where: { OR: invoiceOr as any },
         });
 
         if (!invoice) {
@@ -112,6 +228,20 @@ export async function efiRoutes(fastify: FastifyInstance) {
             ok: true,
             message: "Notificação ignorada (não encontrada localmente)",
           });
+        }
+
+        if (invoice.invoiceKind === "FISCAL_EXTRA_PACK") {
+          request.log.warn(
+            `[EFI Webhook] Fatura extra de pacote fiscal caiu no fluxo legado; ignorando.`,
+          );
+          return reply.send({ ok: true, message: "Use fluxo fpx" });
+        }
+
+        if (!invoice.subscriptionId) {
+          request.log.error(
+            `[EFI Webhook] Fatura ${invoice.id} sem assinatura e não é fpx`,
+          );
+          return reply.code(400).send({ ok: false, message: "Fatura inválida" });
         }
 
         const subscription = await prisma.subscription.findUnique({
