@@ -2,6 +2,7 @@ import amqp from "amqplib";
 import type { Channel } from "amqplib";
 import { prisma } from "../lib/db.js";
 import { qualifyRabbitName } from "../lib/rabbitmqTopology.js";
+import { isModuleIncludedInPlan, normalizePlanFeatures } from "../lib/plan-modules.js";
 
 /**
  * Igual a `Worker/src/lib/rabbitmq` (assertTopology) + `buildFiscalExtraCreditQueueConfig`.
@@ -169,7 +170,7 @@ export const workerService = {
         select: { id: true, name: true, key: true, priceCents: true },
       });
 
-      const planKey = subscription?.plan?.key;
+      const planFeatures = normalizePlanFeatures(subscription?.plan?.features);
 
       // Unificar: IDs salvos na assinatura + IDs de módulos gratuitos + IDs de módulos inclusos no plano
       const freeModuleIds = allActiveModules
@@ -177,18 +178,11 @@ export const workerService = {
         .map((m) => m.id);
 
       const planInclusionIds: string[] = [];
-      if (planKey === "avancado") {
-        const matchingIds = allActiveModules
-          .filter(
-            (m) =>
-              m.key === "vendas_pdv" ||
-              m.key === "emissao_nfce" ||
-              m.name.includes("Vendas") ||
-              m.name.includes("NFC-e"),
-          )
-          .map((m) => m.id);
-        planInclusionIds.push(...matchingIds);
-      }
+      allActiveModules.forEach((m) => {
+        if (isModuleIncludedInPlan(planFeatures, m.key, m.name)) {
+          planInclusionIds.push(m.id);
+        }
+      });
 
       const consolidatedIds = Array.from(
         new Set([...moduleKeys, ...freeModuleIds, ...planInclusionIds]),

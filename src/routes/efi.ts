@@ -320,7 +320,12 @@ export async function efiRoutes(fastify: FastifyInstance) {
             // Ativar empresa e usuário para permitir login
             await tx.company.update({
               where: { id: company.id },
-              data: { active: true },
+              data: {
+                active: true,
+                ...(subscription.tefContracted
+                  ? { tefPaygoHabilitado: true }
+                  : {}),
+              },
             });
 
             await tx.user.update({
